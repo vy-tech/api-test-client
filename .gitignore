@@ -1,5 +1,5 @@
 # Secrets
-app-secrets.conf
+vyclient-secrets.conf
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
