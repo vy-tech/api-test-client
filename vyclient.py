@@ -2,13 +2,21 @@
 
 import argparse
 import configparser
+import json
 import logging
-import math
 import os
+import time
 import requests
 
-CHUNK_SIZE = 5 * 1024 * 1024  # 5 MB
 BASE_URL = "https://vy.vision/api/v1"
+
+MIME_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo",
+    ".m4v": "video/mp4",
+    ".mkv": "video/x-matroska",
+}
 
 
 class VyApiClient:
@@ -24,6 +32,8 @@ class VyApiClient:
                             help='Video file to upload (mp4, mov, avi, m4v, mkv)')
         parser.add_argument('-s', '--status', metavar='VIDEO_ID',
                             help='Get status for a video by ID')
+        parser.add_argument('-r', '--result', metavar='VIDEO_ID',
+                            help='Get result for a video by ID')
         self.args = parser.parse_args()
 
     def init_config(self):
@@ -62,54 +72,51 @@ class VyApiClient:
     def upload_video(self, file_path):
         filename = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
-        num_parts = math.ceil(file_size / CHUNK_SIZE)
+        ext = os.path.splitext(filename)[1].lower()
+        mime_type = MIME_TYPES.get(ext, "application/octet-stream")
 
-        self.log.info(f"Uploading {filename} ({file_size} bytes, {num_parts} part(s))")
+        self.log.info(f"Uploading {filename} ({file_size} bytes)")
 
-        # Step 1: Request upload session
+        # Step 1: Request upload URL and token
         resp = requests.post(
             f"{self._base_url()}/video/upload/request",
             headers=self._headers(),
-            json={"filename": filename},
+            json={"filename": filename, "mimeType": mime_type},
         )
         resp.raise_for_status()
-        upload_id = resp.json()["uploadId"]
-        self.log.debug(f"uploadId: {upload_id}")
+        data = resp.json()
+        upload_url = data["uploadUrl"]
+        upload_token = data["uploadToken"]
+        self.log.debug(f"uploadToken: {upload_token}")
 
-        # Step 2: Upload each part
-        parts = []
+        # Step 2: PUT entire file to upload URL
         with open(file_path, "rb") as fh:
-            for part_number in range(1, num_parts + 1):
-                chunk = fh.read(CHUNK_SIZE)
-                self.log.info(f"Uploading part {part_number}/{num_parts} ({len(chunk)} bytes)")
-
-                # Get presigned URL for this part
-                resp = requests.post(
-                    f"{self._base_url()}/video/upload/part",
-                    headers=self._headers(),
-                    json={"uploadId": upload_id, "partNumber": part_number},
-                )
-                resp.raise_for_status()
-                upload_url = resp.json()["uploadUrl"]
-                self.log.debug(f"Presigned URL: {upload_url}")
-
-                # PUT chunk directly to presigned URL (no auth header)
-                put_resp = requests.put(upload_url, data=chunk)
-                put_resp.raise_for_status()
-                etag = put_resp.headers.get("ETag", "").strip('"')
-                self.log.debug(f"Part {part_number} ETag: {etag}")
-                parts.append({"PartNumber": part_number, "ETag": etag})
+            file_bytes = fh.read()
+        put_resp = requests.put(upload_url, data=file_bytes, headers={"Content-Type": mime_type})
+        put_resp.raise_for_status()
+        self.log.debug(f"PUT response: {put_resp.status_code}")
 
         # Step 3: Complete the upload
         resp = requests.post(
             f"{self._base_url()}/video/upload/complete",
             headers=self._headers(),
-            json={"uploadId": upload_id, "parts": parts},
+            json={"uploadToken": upload_token},
         )
         resp.raise_for_status()
         result = resp.json()
         self.log.info(f"Upload complete: fileId={result.get('fileId')} jobId={result.get('jobId')}")
         return result
+
+    def poll_status(self, file_id, interval=5):
+        TERMINAL = {"completed", "failed"}
+        self.log.info(f"Polling status for fileId={file_id}")
+        while True:
+            result = self.get_status(file_id)
+            statuses = {job.get("status") for job in result.get("jobs", [])}
+            if statuses and statuses <= TERMINAL:
+                break
+            self.log.info(f"Waiting {interval}s...")
+            time.sleep(interval)
 
     def get_status(self, video_id):
         resp = requests.get(
@@ -124,15 +131,31 @@ class VyApiClient:
             self.log.info(f"Job: id={job.get('id')} type={job.get('type')} status={job.get('status')} message={job.get('message')}")
         return result
 
+    def get_result(self, video_id):
+        resp = requests.get(
+            f"{self._base_url()}/video/results/{video_id}",
+            headers=self._headers(),
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        print(json.dumps(result, indent=2))
+
+        return result
+
+
     def start(self):
         self.health_check()
 
-        video_id = self.args.status or self.config.get('DEFAULT', 'video_id', fallback=None)
-
-        if video_id:
-            self.get_status(video_id)
+        if self.args.result:
+            self.get_result(self.args.result)
+        elif self.args.status:
+            self.get_status(self.args.status)
         elif self.args.file:
-            self.upload_video(self.args.file)
+            result = self.upload_video(self.args.file)
+            file_id = result.get("fileId")
+            if file_id:
+                self.poll_status(file_id)
+            self.get_result(file_id)
         else:
             self.log.error("Specify --file to upload or --status VIDEO_ID to check status")
 
